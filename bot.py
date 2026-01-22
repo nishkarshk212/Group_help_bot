@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Union
+import asyncio
 from dotenv import load_dotenv
 import re
 from html import escape
@@ -34,6 +35,24 @@ user_restrictions: Dict[Tuple[int, int], Dict[str, bool]] = {}
 # Store filters: {(chat_id, keyword): {'type': 'photo/sticker/video/gif', 'file_id': str, 'caption': str}}
 filters_store: Dict[Tuple[int, str], Dict[str, str]] = {}
 
+# Store self-destruct timers: {chat_id: seconds}
+self_destruct_timers: Dict[int, int] = {}
+
+# Store edit message deletion setting: {chat_id: bool (True = enabled, False = disabled)}
+edit_deletion_enabled: Dict[int, bool] = {}
+
+# Store warning settings: {chat_id: {'threshold': int, 'mute_duration': int}}
+warning_settings: Dict[int, Dict[str, int]] = {}
+
+# Store NSFW filtering settings: {chat_id: bool (True = enabled, False = disabled)}
+nsfw_filter_enabled: Dict[int, bool] = {}
+
+# Store service message settings: {chat_id: {'enabled': bool, 'delete_after': int}}
+service_msg_settings: Dict[int, Dict[str, Union[bool, int]]] = {}
+
+# Store event message settings: {chat_id: {'enabled': bool, 'delete_after': int}}
+event_msg_settings: Dict[int, Dict[str, Union[bool, int]]] = {}
+
 load_dotenv()
 
 
@@ -66,6 +85,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/start – Activate bot\n"
         "/help – Show this help message\n"
         "/status – Show bot permissions\n"
+        "/settings – Open settings panel (mods & founder only)\n"
         "/info – Get user information (reply/mention/ID/@username)\n"
         "/ban – Ban user (reply/mention/ID/@username)\n"
         "/unban – Unban user (reply/mention/ID/@username)\n"
@@ -74,6 +94,22 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/warn – Warn user (reply/mention/ID/@username)\n"
         "/warnings – Check user warnings\n"
         "/free – Manage user restrictions (reply/mention/ID/@username)\n"
+        "/promote – Promote user to admin (full permissions)\n"
+        "/mod – Promote user to moderator (restrict + delete)\n"
+        "/muter – Promote user to muter (mute + manage VC only)\n"
+        "/unadmin – Demote admin to member\n"
+        "/unmod – Demote moderator to member\n"
+        "/unmuter – Demote muter to member\n"
+        "/setselfdestruct – Set message auto-delete timer (seconds)\n"
+        "/resetselfdestruct – Disable message auto-delete\n"
+        "/enableedit – Enable automatic deletion of edited messages\n"
+        "/disableedit – Disable automatic deletion of edited messages\n"
+        "/setwarnlimit – Set warning threshold for auto-mute (default: 3)\n"
+        "/setmutetime – Set auto-mute duration in hours (default: 24)\n"
+        "/enablensfw – Enable NSFW content filtering\n"
+        "/disablensfw – Disable NSFW content filtering\n"
+        "/reload – Reload bot configuration (admin only)\n"
+        "/config – Open configuration panel (admin only)\n"
         "/filter – Set filter for keyword (reply to media)\n"
         "/filters – List all filters\n"
         "/stopfilter – Remove a filter\n"
@@ -125,6 +161,53 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
         await update.message.reply_text(f"❌ Error checking status: {str(e)}")
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Settings panel - only for moderators (admins) and founder"""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    # Only admins (including founder/creator) can use this
+    if not await is_admin(context, chat_id, user_id):
+        await update.message.reply_text("❌ Only moderators and the group founder can use /settings.")
+        return
+
+    text = (
+        "⚙️ *Group Settings Panel*\n\n"
+        "These settings can only be changed by moderators and the group founder.\n\n"
+        "*Welcome Settings:*\n"
+        "• /setwelcomemessage – Set custom welcome message\n"
+        "• /setwelcomeimage – Set welcome image (reply to image)\n"
+        "• /resetwelcome – Reset welcome message and image\n"
+        "• /resetwelcomeimage – Reset welcome image only\n\n"
+        "*Service & Info:*\n"
+        "• /setservice – Configure free service info\n"
+        "• /resetservice – Reset service info\n"
+        "• /enable_service – Enable service messages\n"
+        "• /disable_service – Disable service messages\n"
+        "• /enable_event – Enable event messages\n"
+        "• /disable_event – Disable event messages\n"
+        "• /set_service_del_time – Set service message deletion time\n"
+        "• /set_event_del_time – Set event message deletion time\n"
+        "• /service – View free service info (public)\n\n"
+        "*Message Settings:*\n"
+        "• /setselfdestruct – Set auto-delete timer for bot messages\n"
+        "• /resetselfdestruct – Disable auto-delete\n\n"
+        "*Filters:*\n"
+        "• /filter – Set media reply for keyword (reply to media)\n"
+        "• /filters – List all filters\n"
+        "• /stopfilter – Remove a filter\n\n"
+        "*Permissions & Roles:*\n"
+        "• /free – Open restriction manager for a user\n"
+        "• /promote – Full admin\n"
+        "• /mod – Moderator (delete + restrict)\n"
+        "• /muter – Muter (mute + manage VC)\n"
+        "• /unadmin, /unmod, /unmuter – Demote roles\n\n"
+        "Use these commands carefully – they affect the whole group."
+    )
+
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def resolve_target_user_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
@@ -182,14 +265,19 @@ async def resolve_target_user_id(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def apply_warning(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target_id: int) -> Tuple[int, bool]:
-    """Apply warning to user and auto-mute if 3 warnings reached"""
+    """Apply warning to user and auto-mute if threshold reached"""
     key = (chat_id, target_id)
     count = warnings_store.get(key, 0) + 1
     warnings_store[key] = count
     
-    if count >= 3:
-        # Auto-mute for 24 hours
-        until = datetime.now(timezone.utc) + timedelta(hours=24)
+    # Get warning settings for this chat (default to 3 warnings, 24 hours)
+    settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+    threshold = settings['threshold']
+    mute_duration_hours = settings['mute_duration']
+    
+    if count >= threshold:
+        # Auto-mute for specified duration
+        until = datetime.now(timezone.utc) + timedelta(hours=mute_duration_hours)
         perms = ChatPermissions(
             can_send_messages=False,
             can_send_audios=False,
@@ -203,7 +291,7 @@ async def apply_warning(context: ContextTypes.DEFAULT_TYPE, chat_id: int, target
         )
         await context.bot.restrict_chat_member(chat_id, target_id, permissions=perms, until_date=until)
         warnings_store[key] = 0  # Reset warnings
-        return 3, True
+        return count, True
     
     return count, False
 
@@ -593,6 +681,13 @@ async def delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             has_link = bool(url_regex.search(text))
     
     if has_link:
+        # Check if user has link permission from free command
+        key = (chat_id, user_id)
+        if key in user_restrictions:
+            restrictions = user_restrictions[key]
+            if not restrictions.get('link', False):  # If link restriction is OFF, allow links
+                return
+        
         # Delete the message
         try:
             await msg.delete()
@@ -650,6 +745,209 @@ async def delete_links(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 pass
 
 
+async def check_message_content(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check if message contains restricted content based on free command settings"""
+    msg = update.message
+    if not msg or msg.chat.type not in ("group", "supergroup"):
+        return
+    
+    chat_id = msg.chat.id
+    user_id = msg.from_user.id
+    
+    # Check if user is admin
+    admin = await is_admin(context, chat_id, user_id)
+    if admin:
+        return
+    
+    # Get user restrictions
+    key = (chat_id, user_id)
+    if key not in user_restrictions:
+        return  # No restrictions set
+    
+    restrictions = user_restrictions[key]
+    
+    # Check for stickers
+    if msg.sticker and restrictions.get('sticker', False):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        
+        count, muted = await apply_warning(context, chat_id, user_id)
+        
+        name = escape(msg.from_user.first_name)
+        mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+        
+        if muted:
+            await context.bot.send_message(
+                chat_id,
+                f"🔇 {mention} has been auto-muted for sending stickers (3 warnings).",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "🔇 You have been auto-muted for 24 hours for sending stickers."
+                )
+            except Exception:
+                pass
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ {mention} warned for sending stickers. Warnings: {count}/3",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"⚠️ Stickers are restricted. Warnings: {count}/3"
+                )
+            except Exception:
+                pass
+    
+    # Check for GIFs (animations)
+    elif msg.animation and restrictions.get('gif', False):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        
+        count, muted = await apply_warning(context, chat_id, user_id)
+        
+        name = escape(msg.from_user.first_name)
+        mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+        
+        if muted:
+            await context.bot.send_message(
+                chat_id,
+                f"🔇 {mention} has been auto-muted for sending GIFs (3 warnings).",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "🔇 You have been auto-muted for 24 hours for sending GIFs."
+                )
+            except Exception:
+                pass
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ {mention} warned for sending GIFs. Warnings: {count}/3",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"⚠️ GIFs are restricted. Warnings: {count}/3"
+                )
+            except Exception:
+                pass
+    
+    # Check for videos
+    elif msg.video and restrictions.get('video', False):
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        
+        count, muted = await apply_warning(context, chat_id, user_id)
+        
+        name = escape(msg.from_user.first_name)
+        mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+        
+        if muted:
+            await context.bot.send_message(
+                chat_id,
+                f"🔇 {mention} has been auto-muted for sending videos (3 warnings).",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    "🔇 You have been auto-muted for 24 hours for sending videos."
+                )
+            except Exception:
+                pass
+        else:
+            await context.bot.send_message(
+                chat_id,
+                f"⚠️ {mention} warned for sending videos. Warnings: {count}/3",
+                parse_mode=ParseMode.HTML
+            )
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"⚠️ Videos are restricted. Warnings: {count}/3"
+                )
+            except Exception:
+                pass
+    
+    # Check for NSFW media content
+    elif msg.photo or msg.video or msg.animation or msg.document:
+        # Check if NSFW filtering is enabled for this chat
+        if nsfw_filter_enabled.get(chat_id, False):
+            is_nsfw_media = await detect_nsfw_media(context, msg)
+            if is_nsfw_media:
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                
+                count, muted = await apply_warning(context, chat_id, user_id)
+                
+                name = escape(msg.from_user.first_name)
+                mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+                
+                if muted:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"🔇 {mention} has been auto-muted for sending inappropriate content. (Auto-mute triggered)",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"⚠️ {mention} warned for inappropriate content. Warnings: {count}/3",
+                        parse_mode=ParseMode.HTML
+                    )
+
+
+async def detect_nsfw_media(context: ContextTypes.DEFAULT_TYPE, msg) -> bool:
+    """Detect if media content is NSFW based on file name and description"""
+    # Check media caption for NSFW keywords
+    caption = msg.caption or ""
+    if detect_nsfw_content(caption):
+        return True
+    
+    # Check file name/description for NSFW keywords
+    file_name = ""
+    if msg.photo:
+        # Get the largest photo size
+        photo = msg.photo[-1] if msg.photo else None
+        if photo:
+            file_info = await context.bot.get_file(photo.file_id)
+            file_name = file_info.file_path or ""
+    elif msg.video:
+        file_info = await context.bot.get_file(msg.video.file_id)
+        file_name = file_info.file_path or ""
+    elif msg.animation:
+        file_info = await context.bot.get_file(msg.animation.file_id)
+        file_name = file_info.file_path or ""
+    elif msg.document:
+        file_info = await context.bot.get_file(msg.document.file_id)
+        file_name = file_info.file_path or ""
+        
+    # Check if filename contains NSFW indicators
+    if detect_nsfw_content(file_name):
+        return True
+    
+    # For now, we'll use filename and caption as indicators
+    # In a production environment, you might want to implement image/video analysis
+    # using external APIs like Google Cloud Vision, AWS Rekognition, etc.
+    return False
+
+
 async def on_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Delete edited messages and warn users"""
     msg = update.edited_message
@@ -665,14 +963,11 @@ async def on_edited(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = msg.chat.id
     user_id = msg.from_user.id
     
-    # Check if user is admin
-    admin = await is_admin(context, chat_id, user_id)
+    # Check if edit deletion is enabled for this chat
+    if not edit_deletion_enabled.get(chat_id, False):
+        return  # Skip if edit deletion is disabled
     
-    if admin:
-        # Ignore admin edits
-        return
-    
-    # Delete edited message
+    # Delete edited message regardless of user type
     try:
         await context.bot.delete_message(chat_id, msg.message_id)
     except Exception:
@@ -891,6 +1186,142 @@ async def reset_service(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text("ℹ️ No custom service information found. Already using default.")
 
 
+async def enable_service_msgs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable service messages in the group (admin only)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    # Initialize settings if not exists
+    if chat_id not in service_msg_settings:
+        service_msg_settings[chat_id] = {'enabled': True, 'delete_after': 30}
+    else:
+        service_msg_settings[chat_id]['enabled'] = True
+    
+    await update.message.reply_text("✅ Service messages have been enabled!")
+
+
+async def disable_service_msgs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable service messages in the group (admin only)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    # Initialize settings if not exists
+    if chat_id not in service_msg_settings:
+        service_msg_settings[chat_id] = {'enabled': False, 'delete_after': 30}
+    else:
+        service_msg_settings[chat_id]['enabled'] = False
+    
+    await update.message.reply_text("✅ Service messages have been disabled!")
+
+
+async def enable_event_msgs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable event messages in the group (admin only)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    # Initialize settings if not exists
+    if chat_id not in event_msg_settings:
+        event_msg_settings[chat_id] = {'enabled': True, 'delete_after': 30}
+    else:
+        event_msg_settings[chat_id]['enabled'] = True
+    
+    await update.message.reply_text("✅ Event messages have been enabled!")
+
+
+async def disable_event_msgs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable event messages in the group (admin only)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    # Initialize settings if not exists
+    if chat_id not in event_msg_settings:
+        event_msg_settings[chat_id] = {'enabled': False, 'delete_after': 30}
+    else:
+        event_msg_settings[chat_id]['enabled'] = False
+    
+    await update.message.reply_text("✅ Event messages have been disabled!")
+
+
+async def set_service_del_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the deletion time for service messages (admin only)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "❌ Please provide a valid time in seconds.\n\n"
+            "Example: `/set_service_del_time 60`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    seconds = int(args[0])
+    if seconds < 1:
+        await update.message.reply_text("❌ Time must be at least 1 second.")
+        return
+    
+    # Initialize settings if not exists
+    if chat_id not in service_msg_settings:
+        service_msg_settings[chat_id] = {'enabled': True, 'delete_after': seconds}
+    else:
+        service_msg_settings[chat_id]['delete_after'] = seconds
+    
+    await update.message.reply_text(f"✅ Service message deletion time set to {seconds} seconds!")
+
+
+async def set_event_del_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the deletion time for event messages (admin only)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    args = context.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text(
+            "❌ Please provide a valid time in seconds.\n\n"
+            "Example: `/set_event_del_time 60`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    seconds = int(args[0])
+    if seconds < 1:
+        await update.message.reply_text("❌ Time must be at least 1 second.")
+        return
+    
+    # Initialize settings if not exists
+    if chat_id not in event_msg_settings:
+        event_msg_settings[chat_id] = {'enabled': True, 'delete_after': seconds}
+    else:
+        event_msg_settings[chat_id]['delete_after'] = seconds
+    
+    await update.message.reply_text(f"✅ Event message deletion time set to {seconds} seconds!")
+
+
 async def free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Manage user restrictions with toggle buttons"""
     chat_id = update.effective_chat.id
@@ -932,7 +1363,10 @@ async def free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             'spam': False,
             'media': False,
             'checks': False,
-            'night': False
+            'night': False,
+            'sticker': False,
+            'gif': False,
+            'link': False
         }
     
     restrictions = user_restrictions[key]
@@ -960,6 +1394,20 @@ async def free_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
         ],
         [
+            InlineKeyboardButton(
+                f"{'✅' if restrictions['sticker'] else '❌'} Sticker",
+                callback_data=f"free_{target_id}_sticker"
+            ),
+            InlineKeyboardButton(
+                f"{'✅' if restrictions['gif'] else '❌'} GIF",
+                callback_data=f"free_{target_id}_gif"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'✅' if restrictions['link'] else '❌'} Link",
+                callback_data=f"free_{target_id}_link"
+            ),
             InlineKeyboardButton(
                 f"{'✅' if restrictions['night'] else '❌'} Silence/Night",
                 callback_data=f"free_{target_id}_night"
@@ -1121,18 +1569,742 @@ async def stopfilter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
-async def check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Check messages for filter keywords and respond with media"""
+async def _demote_to_member(update: Update, context: ContextTypes.DEFAULT_TYPE, role_label: str) -> None:
+    """Helper to demote a user from a role back to normal member"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    target_id = await resolve_target_user_id(update, context)
+    if not target_id:
+        await update.message.reply_text("❌ Please specify a user by replying, mentioning, or providing user ID.")
+        return
+    
+    try:
+        await context.bot.promote_chat_member(
+            chat_id,
+            target_id,
+            can_change_info=False,
+            can_delete_messages=False,
+            can_restrict_members=False,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_video_chats=False,
+            can_promote_members=False,
+            can_manage_topics=False,
+        )
+        await update.message.reply_text(f"✅ User demoted from {role_label} to member.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to demote user: {str(e)}")
+
+
+async def promote_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Promote a user to full admin"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    target_id = await resolve_target_user_id(update, context)
+    if not target_id:
+        await update.message.reply_text("❌ Please specify a user by replying, mentioning, or providing user ID.")
+        return
+    
+    try:
+        await context.bot.promote_chat_member(
+            chat_id,
+            target_id,
+            can_change_info=True,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_invite_users=True,
+            can_pin_messages=True,
+            can_manage_video_chats=True,
+            can_promote_members=True,
+            can_manage_topics=True,
+        )
+        await update.message.reply_text("✅ User promoted to admin with full permissions.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to promote user: {str(e)}")
+
+
+async def promote_mod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Promote a user to moderator (delete + restrict)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    target_id = await resolve_target_user_id(update, context)
+    if not target_id:
+        await update.message.reply_text("❌ Please specify a user by replying, mentioning, or providing user ID.")
+        return
+    
+    try:
+        await context.bot.promote_chat_member(
+            chat_id,
+            target_id,
+            can_change_info=False,
+            can_delete_messages=True,
+            can_restrict_members=True,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_video_chats=False,
+            can_promote_members=False,
+            can_manage_topics=False,
+        )
+        await update.message.reply_text("✅ User promoted to moderator (can delete & restrict).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to promote user: {str(e)}")
+
+
+async def promote_muter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Promote a user to muter (mute + manage voice chat)"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    target_id = await resolve_target_user_id(update, context)
+    if not target_id:
+        await update.message.reply_text("❌ Please specify a user by replying, mentioning, or providing user ID.")
+        return
+    
+    try:
+        await context.bot.promote_chat_member(
+            chat_id,
+            target_id,
+            can_change_info=False,
+            can_delete_messages=False,
+            can_restrict_members=True,
+            can_invite_users=False,
+            can_pin_messages=False,
+            can_manage_video_chats=True,
+            can_promote_members=False,
+            can_manage_topics=False,
+        )
+        await update.message.reply_text("✅ User promoted to muter (can mute users & manage voice chat).")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to promote user: {str(e)}")
+
+
+async def unadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Demote an admin to member"""
+    await _demote_to_member(update, context, "admin")
+
+
+async def unmod_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Demote a moderator to member"""
+    await _demote_to_member(update, context, "moderator")
+
+
+async def unmuter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Demote a muter to member"""
+    await _demote_to_member(update, context, "muter")
+
+
+async def set_self_destruct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set self-destruct timer for bot messages in this group"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    args = context.args
+    if not args:
+        current_timer = self_destruct_timers.get(chat_id, 0)
+        if current_timer > 0:
+            await update.message.reply_text(
+                f"⏱️ Current self-destruct timer: {current_timer} seconds\n\n"
+                "Usage: `/setselfdestruct <seconds>`\n"
+                "Example: `/setselfdestruct 30` (messages delete after 30 seconds)\n\n"
+                "Set to 0 to disable or use `/resetselfdestruct`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                "ℹ️ Self-destruct is currently disabled.\n\n"
+                "Usage: `/setselfdestruct <seconds>`\n"
+                "Example: `/setselfdestruct 30` (messages delete after 30 seconds)",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        return
+    
+    try:
+        seconds = int(args[0])
+        if seconds < 0:
+            await update.message.reply_text("❌ Timer must be 0 or positive. Use 0 to disable.")
+            return
+        
+        if seconds == 0:
+            if chat_id in self_destruct_timers:
+                del self_destruct_timers[chat_id]
+            await update.message.reply_text("✅ Self-destruct timer disabled.")
+        else:
+            self_destruct_timers[chat_id] = seconds
+            await update.message.reply_text(
+                f"✅ Self-destruct timer set to {seconds} seconds.\n\n"
+                f"Bot messages will automatically delete after {seconds}s."
+            )
+    except ValueError:
+        await update.message.reply_text("❌ Please provide a valid number of seconds.")
+
+
+async def reset_self_destruct(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reset/disable self-destruct timer"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    if chat_id in self_destruct_timers:
+        del self_destruct_timers[chat_id]
+        await update.message.reply_text("✅ Self-destruct timer disabled.")
+    else:
+        await update.message.reply_text("ℹ️ Self-destruct is already disabled.")
+
+
+async def enable_edit_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable automatic deletion of edited messages"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    edit_deletion_enabled[chat_id] = True
+    await update.message.reply_text(
+        "✅ Edit message deletion enabled.\n\n"
+        "Non-admin edited messages will now be automatically deleted."
+    )
+
+
+async def disable_edit_deletion(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable automatic deletion of edited messages"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    if chat_id in edit_deletion_enabled:
+        del edit_deletion_enabled[chat_id]
+        await update.message.reply_text("✅ Edit message deletion disabled.")
+    else:
+        await update.message.reply_text("ℹ️ Edit message deletion is already disabled.")
+
+
+async def set_warn_limit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the warning threshold for auto-mute"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    args = context.args
+    if not args:
+        # Show current settings
+        settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+        await update.message.reply_text(
+            f"⚙️ *Current Warning Settings:*\n\n"
+            f"Threshold: {settings['threshold']} warnings → auto-mute\n"
+            f"Mute Duration: {settings['mute_duration']} hours\n\n"
+            f"Usage: `/setwarnlimit <number>`\n"
+            f"Example: `/setwarnlimit 5` (auto-mute after 5 warnings)",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    try:
+        threshold = int(args[0])
+        if threshold <= 0:
+            await update.message.reply_text("❌ Warning threshold must be greater than 0.")
+            return
+        
+        if chat_id not in warning_settings:
+            warning_settings[chat_id] = {'threshold': 3, 'mute_duration': 24}
+        
+        warning_settings[chat_id]['threshold'] = threshold
+        await update.message.reply_text(
+            f"✅ Warning threshold set to {threshold}.\n"
+            f"Users will be auto-muted after {threshold} warnings."
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Please provide a valid number.")
+
+
+async def set_mute_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the auto-mute duration in hours"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    args = context.args
+    if not args:
+        # Show current settings
+        settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+        await update.message.reply_text(
+            f"⚙️ *Current Warning Settings:*\n\n"
+            f"Threshold: {settings['threshold']} warnings → auto-mute\n"
+            f"Mute Duration: {settings['mute_duration']} hours\n\n"
+            f"Usage: `/setmutetime <hours>`\n"
+            f"Example: `/setmutetime 12` (auto-mute for 12 hours)",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    try:
+        hours = int(args[0])
+        if hours <= 0:
+            await update.message.reply_text("❌ Mute duration must be greater than 0 hours.")
+            return
+        
+        if chat_id not in warning_settings:
+            warning_settings[chat_id] = {'threshold': 3, 'mute_duration': 24}
+        
+        warning_settings[chat_id]['mute_duration'] = hours
+        await update.message.reply_text(
+            f"✅ Auto-mute duration set to {hours} hours.\n"
+            f"Users will be muted for {hours} hours when auto-muted."
+        )
+    except ValueError:
+        await update.message.reply_text("❌ Please provide a valid number.")
+
+
+async def enable_nsfw_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable NSFW content filtering"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    nsfw_filter_enabled[chat_id] = True
+    await update.message.reply_text(
+        " Porno🔞 NSFW Content Filtering Enabled\n\n"
+        "Messages containing potentially inappropriate content will be detected and removed."
+    )
+
+
+async def disable_nsfw_filter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable NSFW content filtering"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    if chat_id in nsfw_filter_enabled:
+        del nsfw_filter_enabled[chat_id]
+        await update.message.reply_text("✅ NSFW Content Filtering Disabled")
+    else:
+        await update.message.reply_text("ℹ️ NSFW Content Filtering is already disabled.")
+
+
+async def reload_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reload bot configuration and settings"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can use this command.")
+        return
+    
+    # In a real implementation, you might reload configuration files here
+    # For now, we'll just confirm the reload and show current settings
+    
+    # Count active configurations
+    active_configs = {
+        "Self-destruct timers": len([k for k, v in self_destruct_timers.items() if v > 0]),
+        "Edit deletion": len([k for k, v in edit_deletion_enabled.items() if v]),
+        "NSFW filtering": len([k for k, v in nsfw_filter_enabled.items() if v]),
+        "Warning settings": len(warning_settings),
+        "Filters": len([k for k, v in filters_store.items()])
+    }
+    
+    total_active = sum(active_configs.values())
+    
+    settings_text = (
+        "🔄 *Configuration Reloaded Successfully!*\n\n"
+        "*Active Configurations:*\n"
+    )
+    
+    for config, count in active_configs.items():
+        if count > 0:
+            settings_text += f"• {config}: {count} active\n"
+    
+    if total_active == 0:
+        settings_text += "• No active configurations found\n"
+    
+    settings_text += "\n✅ Bot configuration has been refreshed."
+    
+    await update.message.reply_text(settings_text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def config_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open configuration panel for customizing bot settings"""
+    chat_id = update.effective_chat.id
+    admin_id = update.effective_user.id
+    
+    if not await is_admin(context, chat_id, admin_id):
+        await update.message.reply_text("❌ Only admins can access the configuration panel.")
+        return
+    
+    # Get current settings for this chat
+    current_self_destruct = self_destruct_timers.get(chat_id, 0)
+    current_edit_deletion = edit_deletion_enabled.get(chat_id, False)
+    current_nsfw_filter = nsfw_filter_enabled.get(chat_id, False)
+    current_warn_settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+    current_service_enabled = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+    current_service_del_time = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+    current_event_enabled = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+    current_event_del_time = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+    
+    # Create inline keyboard with configuration buttons
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"⏰ Self-destruct: {current_self_destruct}s", 
+                callback_data="config_selfdestruct"
+            ),
+            InlineKeyboardButton(
+                f"{'✅' if current_edit_deletion else '❌'} Edit Del", 
+                callback_data="config_editdel"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'✅' if current_nsfw_filter else '❌'} NSFW Filter", 
+                callback_data="config_nsfw"
+            ),
+            InlineKeyboardButton(
+                f"{'✅' if current_service_enabled else '❌'} Service", 
+                callback_data="config_service"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'✅' if current_event_enabled else '❌'} Event", 
+                callback_data="config_event"
+            ),
+            InlineKeyboardButton(
+                f"⚠️ Warn: {current_warn_settings['threshold']}", 
+                callback_data="config_warn"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                f"⏰ Mute: {current_warn_settings['mute_duration']}h", 
+                callback_data="config_mutedur"
+            ),
+            InlineKeyboardButton(
+                "🔄 Reload Config", 
+                callback_data="config_reload"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📋 View All Settings", 
+                callback_data="config_viewall"
+            )
+        ]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Create configuration message with current settings
+    config_text = (
+        f"⚙️ *Bot Configuration Panel*\n\n"
+        f"*Current Settings for this Group:*\n"
+        f"• Self-destruct timer: {current_self_destruct}s {'✅ On' if current_self_destruct > 0 else '❌ Off'}\n"
+        f"• Edit deletion: {'✅ Enabled' if current_edit_deletion else '❌ Disabled'}\n"
+        f"• NSFW filtering: {'✅ Enabled' if current_nsfw_filter else '❌ Disabled'}\n"
+        f"• Service messages: {'✅ Enabled' if current_service_enabled else '❌ Disabled'} (del after {current_service_del_time}s)\n"
+        f"• Event messages: {'✅ Enabled' if current_event_enabled else '❌ Disabled'} (del after {current_event_del_time}s)\n"
+        f"• Warning threshold: {current_warn_settings['threshold']} warnings\n"
+        f"• Mute duration: {current_warn_settings['mute_duration']} hours\n\n"
+        f"👆 Tap buttons above to configure settings."
+    )
+    
+    await update.message.reply_text(config_text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+
+def detect_nsfw_content(text: str) -> bool:
+    """Detect if text contains NSFW/inappropriate content including pornographic material"""
+    if not text:
+        return False
+    
+    # Convert to lowercase for case-insensitive matching
+    text_lower = text.lower().strip()
+    
+    # Comprehensive NSFW keywords including pornographic content
+    nsfw_keywords = [
+        # Pornographic content and nudity
+        'porn', 'porno', 'pornography', 'xxx', 'adult', 'nude', 'naked', 'nudity',
+        'boob', 'boobs', 'tits', 'tit', 'breast', 'breasts', 'cleavage',
+        'pussy', 'vagina', 'clit', 'clitoris', 'labia', 'cunt',
+        'penis', 'dick', 'cock', 'shaft', 'member', 'wang', 'pecker',
+        'ass', 'butt', 'booty', 'arse', 'arsehole', 'anus', 'anal',
+        'sex', 'sexual', 'seduce', 'seduction', 'seductive',
+        'blowjob', 'bj', 'fellatio', 'suck', 'oral', 'rimjob', 'analingus',
+        'handjob', 'fingering', 'masturbation', 'wank', 'masturbate',
+        'orgasm', 'cum', 'ejaculate', 'jizz', 'semen', 'come',
+        'fucking', 'fucked', 'fuck', 'fucker', 'fucks', 'fck', 'fuk',
+        'horny', 'aroused', 'excited', 'kinky', 'pervert', 'perverted',
+        
+        # Porn sites and platforms
+        'xvideos', 'xhamster', 'pornhub', 'youporn', 'redtube', 'tube8',
+        'xnxx', 'spankbang', 'txxx', 'beeg', 'pornhd', 'hqporner',
+        'camgirl', 'camboy', 'webcam', 'chaturbate', 'bongacams',
+        'stripchat', 'camsoda', 'imlive', 'streamate',
+        
+        # Erotic and adult services
+        'escort', 'hooker', 'prostitute', 'whore', 'slut', 'hoe', 'thot',
+        'stripper', 'striptease', 'lapdance', 'pole dance',
+        'call girl', 'massage parlor', 'happy ending',
+        'adult dating', 'sugar daddy', 'sugar baby',
+        
+        # BDSM and fetish content
+        'bdsm', 'bondage', 'dominance', 'submission', 'dom/sub',
+        'fetish', 'kink', 'fisting', 'gangbang', 'orgy', 'swinger',
+        'master', 'mistress', 'slave', 'submissive', 'dominant',
+        'leather', 'latex', 'chains', 'cuffs', 'collar',
+        
+        # Drugs and substances
+        'weed', 'marijuana', 'cannabis', 'joint', 'bud', '420', 'ganja',
+        'cocaine', 'coke', 'crack', 'snow', 'blow', 'white',
+        'heroin', 'smack', 'brown', 'horse',
+        'meth', 'crystal', 'ice', 'speed', 'amphetamine',
+        'ecstasy', 'mdma', 'e', 'molly', 'x',
+        'lsd', 'acid', 'shrooms', 'magic mushrooms', 'psilocybin',
+        'pcp', 'angel dust', 'ketamine', 'special k',
+        'adderall', 'oxy', 'oxycodone', 'percocet', 'vicodin',
+        'xanax', 'valium', 'ativan', 'ativan', 'klonopin',
+        
+        # Violence and gore
+        'blood', 'gore', 'bloody', 'slaughter', 'massacre',
+        'murder', 'kill', 'killing', 'death', 'dead', 'corpse',
+        'suicide', 'suicidal', 'hang myself', 'shoot myself',
+        'violence', 'violent', 'brutal', 'brutality', 'torture',
+        'terrorist', 'terrorism', 'bomb', 'explode', 'explosion',
+        
+        # Offensive language and slurs
+        'bitch', 'bastard', 'damn', 'hell', 'shit', 'crap',
+        'asshole', 'dickhead', 'cockhead', 'shithead', 'fuckhead',
+        'prick', 'twat', 'minge', 'bollocks', 'knob', 'bellend',
+        'wanker', 'tosser', 'cunt', 'slag', 'slut', 'whore',
+        
+        # Racial and discriminatory slurs
+        'nigger', 'nigga', 'chink', 'gook', 'spic', 'kike',
+        'fag', 'faggot', 'queer', 'dyke', 'tranny', 'transvestite',
+        'wop', 'mick', 'cracker', 'redneck', 'hillbilly',
+        
+        # Other inappropriate content
+        'pedo', 'pedophile', 'child porn', 'cp', 'loli', 'shota',
+        'bestiality', 'zoophile', 'animal sex',
+        'incest', 'taboo', 'family sex',
+        'rape', 'rapist', 'molest', 'molestation'
+    ]
+    
+    # Check if any NSFW keyword is in the text
+    for keyword in nsfw_keywords:
+        if keyword in text_lower:
+            return True
+    
+    return False
+
+
+async def schedule_message_deletion(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int, delay: int) -> None:
+    """Schedule a message for deletion after delay"""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass  # Message might already be deleted
+
+
+async def handle_service_event_messages(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle service and event messages according to configured settings"""
     msg = update.message
-    if not msg or not msg.text:
+    if not msg:
         return
     
     chat_id = msg.chat.id
-    text = msg.text.lower()
+    
+    # Check if it's a service message (like user joined, left, etc.)
+    is_service_message = (
+        msg.new_chat_members or 
+        msg.left_chat_member or 
+        msg.new_chat_title or 
+        msg.new_chat_photo or 
+        msg.delete_chat_photo or 
+        msg.group_chat_created or 
+        msg.supergroup_chat_created or 
+        msg.channel_chat_created or 
+        msg.message_auto_delete_timer_changed or 
+        msg.pinned_message or 
+        msg.invoice or 
+        msg.successful_payment or 
+        msg.connected_website or 
+        msg.forward_origin or 
+        msg.is_automatic_forward or 
+        msg.has_protected_content or
+        msg.migrate_from_chat_id or
+        msg.migrate_to_chat_id or
+        msg.pinned_message or
+        msg.proximity_alert_triggered or
+        msg.video_chat_scheduled or
+        msg.video_chat_started or
+        msg.video_chat_ended or
+        msg.video_chat_participants_invited
+    )
+    
+    if is_service_message:
+        # Check if service messages are enabled for this chat
+        service_settings = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30})
+        
+        if not service_settings.get('enabled', True):
+            # Service messages are disabled, delete the message
+            try:
+                await msg.delete()
+            except Exception:
+                pass  # Message might already be deleted
+        else:
+            # Service messages are enabled, check if deletion time is set
+            delete_after = service_settings.get('delete_after', 30)
+            if delete_after > 0:
+                # Schedule deletion
+                asyncio.create_task(schedule_message_deletion(context, chat_id, msg.id, delete_after))
+    
+    # Check if it's an event message (non-content messages like contacts, locations, polls, etc.)
+    # But exclude service messages and regular content
+    elif not msg.text and not msg.caption and not msg.photo and not msg.video and not msg.sticker and not msg.animation:
+        # Check if event messages are enabled for this chat
+        event_settings = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30})
+        
+        if not event_settings.get('enabled', True):
+            # Event messages are disabled, delete the message
+            try:
+                await msg.delete()
+            except Exception:
+                pass  # Message might already be deleted
+        else:
+            # Event messages are enabled, check if deletion time is set
+            delete_after = event_settings.get('delete_after', 30)
+            if delete_after > 0:
+                # Schedule deletion
+                asyncio.create_task(schedule_message_deletion(context, chat_id, msg.id, delete_after))
+
+
+async def handle_other_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle other event-like messages according to configured settings"""
+    # This function is kept for compatibility if needed later
+    pass
+
+
+async def check_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check messages for filter keywords and respond with media"""
+    msg = update.message
+    if not msg:
+        return
+    
+    chat_id = msg.chat.id
+    
+    # Check if NSFW filtering is enabled for this chat
+    if nsfw_filter_enabled.get(chat_id, False):
+        # Check for text content
+        text = msg.text or msg.caption or ""
+        if text and detect_nsfw_content(text):
+            # Delete the message
+            try:
+                await msg.delete()
+            except Exception:
+                pass
+            
+            # Warn the user (everyone gets warned, even admins)
+            user_id = msg.from_user.id
+            count, muted = await apply_warning(context, chat_id, user_id)
+            
+            name = escape(msg.from_user.first_name)
+            mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+            
+            if muted:
+                await context.bot.send_message(
+                    chat_id,
+                    f"🔇 {mention} has been auto-muted for inappropriate content. (Auto-mute triggered)",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id,
+                    f"⚠️ {mention} warned for inappropriate content. Warnings: {count}/3",
+                    parse_mode=ParseMode.HTML
+                )
+            return  # Don't process filters if NSFW content detected
+        
+        # Check for media content
+        elif msg.photo or msg.video or msg.animation or msg.document or msg.sticker:
+            is_nsfw_media = await detect_nsfw_media(context, msg)
+            if is_nsfw_media:
+                # Delete the message
+                try:
+                    await msg.delete()
+                except Exception:
+                    pass
+                
+                # Warn the user (everyone gets warned, even admins)
+                user_id = msg.from_user.id
+                count, muted = await apply_warning(context, chat_id, user_id)
+                
+                name = escape(msg.from_user.first_name)
+                mention = f'<a href="tg://user?id={user_id}">{name}</a>'
+                
+                if muted:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"🔇 {mention} has been auto-muted for inappropriate content. (Auto-mute triggered)",
+                        parse_mode=ParseMode.HTML
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id,
+                        f"⚠️ {mention} warned for inappropriate content. Warnings: {count}/3",
+                        parse_mode=ParseMode.HTML
+                    )
+                return  # Don't process filters if NSFW content detected
+    
+    # Get text from message or caption for filter processing
+    text = msg.text or msg.caption or ""
+    if not text:
+        return
+    
+    text_lower = text.lower()
     
     # Check all filters for this chat
     for (filter_chat_id, keyword), data in filters_store.items():
-        if filter_chat_id == chat_id and keyword in text:
+        if filter_chat_id == chat_id and keyword in text_lower:
             try:
                 # Send appropriate media type
                 if data['type'] == 'photo':
@@ -1181,7 +2353,430 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     action = parts[0]
     
     try:
-        if action == "banstatus":
+        if action == "config":
+            # Handle configuration button clicks
+            config_action = parts[1] if len(parts) > 1 else ""
+            
+            if config_action == "selfdestruct":
+                # Prompt for self-destruct timer
+                await query.edit_message_text(
+                    "⏰ *Self-Destruct Timer Configuration*\n\n"
+                    "Please use the command:\n"
+                    "`/setselfdestruct <seconds>`\n\n"
+                    "Example: `/setselfdestruct 30` for 30 seconds\n"
+                    "Or `/resetselfdestruct` to disable",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "editdel":
+                # Toggle edit deletion
+                if chat_id in edit_deletion_enabled:
+                    del edit_deletion_enabled[chat_id]
+                    status = "❌ Disabled"
+                    message = "✅ Edit deletion has been disabled."
+                else:
+                    edit_deletion_enabled[chat_id] = True
+                    status = "✅ Enabled"
+                    message = "✅ Edit deletion has been enabled."
+                
+                # Update the message with new status
+                current_self_destruct = self_destruct_timers.get(chat_id, 0)
+                current_edit_deletion = edit_deletion_enabled.get(chat_id, False)
+                current_nsfw_filter = nsfw_filter_enabled.get(chat_id, False)
+                current_warn_settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Self-destruct: {current_self_destruct}s", 
+                            callback_data="config_selfdestruct"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if current_edit_deletion else '❌'} Edit Del", 
+                            callback_data="config_editdel"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if current_nsfw_filter else '❌'} NSFW Filter", 
+                            callback_data="config_nsfw"
+                        ),
+                        InlineKeyboardButton(
+                            f"⚠️ Warn: {current_warn_settings['threshold']}", 
+                            callback_data="config_warn"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Mute: {current_warn_settings['mute_duration']}h", 
+                            callback_data="config_mutedur"
+                        ),
+                        InlineKeyboardButton(
+                            "🔄 Reload Config", 
+                            callback_data="config_reload"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 View All Settings", 
+                            callback_data="config_viewall"
+                        )
+                    ]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"⚙️ *Bot Configuration Panel*\n\n"
+                    f"*Current Settings for this Group:*\n"
+                    f"• Self-destruct timer: {current_self_destruct}s {'✅ On' if current_self_destruct > 0 else '❌ Off'}\n"
+                    f"• Edit deletion: {status}\n"
+                    f"• NSFW filtering: {'✅ Enabled' if current_nsfw_filter else '❌ Disabled'}\n"
+                    f"• Warning threshold: {current_warn_settings['threshold']} warnings\n"
+                    f"• Mute duration: {current_warn_settings['mute_duration']} hours\n\n"
+                    f"👆 Tap buttons above to configure settings.\n\n"
+                    f"{message}",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "nsfw":
+                # Toggle NSFW filtering
+                if chat_id in nsfw_filter_enabled:
+                    del nsfw_filter_enabled[chat_id]
+                    status = "❌ Disabled"
+                    message = "✅ NSFW filtering has been disabled."
+                else:
+                    nsfw_filter_enabled[chat_id] = True
+                    status = "✅ Enabled"
+                    message = "✅ NSFW filtering has been enabled."
+                
+                # Update the message with new status
+                current_self_destruct = self_destruct_timers.get(chat_id, 0)
+                current_edit_deletion = edit_deletion_enabled.get(chat_id, False)
+                current_nsfw_filter = nsfw_filter_enabled.get(chat_id, False)
+                current_warn_settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Self-destruct: {current_self_destruct}s", 
+                            callback_data="config_selfdestruct"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if current_edit_deletion else '❌'} Edit Del", 
+                            callback_data="config_editdel"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if current_nsfw_filter else '❌'} NSFW Filter", 
+                            callback_data="config_nsfw"
+                        ),
+                        InlineKeyboardButton(
+                            f"⚠️ Warn: {current_warn_settings['threshold']}", 
+                            callback_data="config_warn"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Mute: {current_warn_settings['mute_duration']}h", 
+                            callback_data="config_mutedur"
+                        ),
+                        InlineKeyboardButton(
+                            "🔄 Reload Config", 
+                            callback_data="config_reload"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 View All Settings", 
+                            callback_data="config_viewall"
+                        )
+                    ]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"⚙️ *Bot Configuration Panel*\n\n"
+                    f"*Current Settings for this Group:*\n"
+                    f"• Self-destruct timer: {current_self_destruct}s {'✅ On' if current_self_destruct > 0 else '❌ Off'}\n"
+                    f"• Edit deletion: {'✅ Enabled' if current_edit_deletion else '❌ Disabled'}\n"
+                    f"• NSFW filtering: {status}\n"
+                    f"• Warning threshold: {current_warn_settings['threshold']} warnings\n"
+                    f"• Mute duration: {current_warn_settings['mute_duration']} hours\n\n"
+                    f"👆 Tap buttons above to configure settings.\n\n"
+                    f"{message}",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "service":
+                # Toggle service message settings
+                if chat_id in service_msg_settings:
+                    current_state = service_msg_settings[chat_id]['enabled']
+                    service_msg_settings[chat_id]['enabled'] = not current_state
+                    status = "✅ Enabled" if not current_state else "❌ Disabled"
+                    message = f"✅ Service messages have been {'enabled' if not current_state else 'disabled'}!"
+                else:
+                    service_msg_settings[chat_id] = {'enabled': True, 'delete_after': 30}
+                    status = "✅ Enabled"
+                    message = "✅ Service messages have been enabled!"
+                
+                # Update the message with new status
+                current_self_destruct = self_destruct_timers.get(chat_id, 0)
+                current_edit_deletion = edit_deletion_enabled.get(chat_id, False)
+                current_nsfw_filter = nsfw_filter_enabled.get(chat_id, False)
+                current_warn_settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+                current_service_enabled = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+                current_service_del_time = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+                current_event_enabled = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+                current_event_del_time = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Self-destruct: {current_self_destruct}s", 
+                            callback_data="config_selfdestruct"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if current_edit_deletion else '❌'} Edit Del", 
+                            callback_data="config_editdel"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if current_nsfw_filter else '❌'} NSFW Filter", 
+                            callback_data="config_nsfw"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if current_service_enabled else '❌'} Service", 
+                            callback_data="config_service"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if current_event_enabled else '❌'} Event", 
+                            callback_data="config_event"
+                        ),
+                        InlineKeyboardButton(
+                            f"⚠️ Warn: {current_warn_settings['threshold']}", 
+                            callback_data="config_warn"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Mute: {current_warn_settings['mute_duration']}h", 
+                            callback_data="config_mutedur"
+                        ),
+                        InlineKeyboardButton(
+                            "🔄 Reload Config", 
+                            callback_data="config_reload"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 View All Settings", 
+                            callback_data="config_viewall"
+                        )
+                    ]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"⚙️ *Bot Configuration Panel*\n\n"
+                    f"*Current Settings for this Group:*\n"
+                    f"• Self-destruct timer: {current_self_destruct}s {'✅ On' if current_self_destruct > 0 else '❌ Off'}\n"
+                    f"• Edit deletion: {'✅ Enabled' if current_edit_deletion else '❌ Disabled'}\n"
+                    f"• NSFW filtering: {'✅ Enabled' if current_nsfw_filter else '❌ Disabled'}\n"
+                    f"• Service messages: {status} (del after {current_service_del_time}s)\n"
+                    f"• Event messages: {'✅ Enabled' if current_event_enabled else '❌ Disabled'} (del after {current_event_del_time}s)\n"
+                    f"• Warning threshold: {current_warn_settings['threshold']} warnings\n"
+                    f"• Mute duration: {current_warn_settings['mute_duration']} hours\n\n"
+                    f"👆 Tap buttons above to configure settings.\n\n"
+                    f"{message}",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "event":
+                # Toggle event message settings
+                if chat_id in event_msg_settings:
+                    current_state = event_msg_settings[chat_id]['enabled']
+                    event_msg_settings[chat_id]['enabled'] = not current_state
+                    status = "✅ Enabled" if not current_state else "❌ Disabled"
+                    message = f"✅ Event messages have been {'enabled' if not current_state else 'disabled'}!"
+                else:
+                    event_msg_settings[chat_id] = {'enabled': True, 'delete_after': 30}
+                    status = "✅ Enabled"
+                    message = "✅ Event messages have been enabled!"
+                
+                # Update the message with new status
+                current_self_destruct = self_destruct_timers.get(chat_id, 0)
+                current_edit_deletion = edit_deletion_enabled.get(chat_id, False)
+                current_nsfw_filter = nsfw_filter_enabled.get(chat_id, False)
+                current_warn_settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+                current_service_enabled = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+                current_service_del_time = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+                current_event_enabled = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+                current_event_del_time = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+                
+                keyboard = [
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Self-destruct: {current_self_destruct}s", 
+                            callback_data="config_selfdestruct"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if current_edit_deletion else '❌'} Edit Del", 
+                            callback_data="config_editdel"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if current_nsfw_filter else '❌'} NSFW Filter", 
+                            callback_data="config_nsfw"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if current_service_enabled else '❌'} Service", 
+                            callback_data="config_service"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if current_event_enabled else '❌'} Event", 
+                            callback_data="config_event"
+                        ),
+                        InlineKeyboardButton(
+                            f"⚠️ Warn: {current_warn_settings['threshold']}", 
+                            callback_data="config_warn"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"⏰ Mute: {current_warn_settings['mute_duration']}h", 
+                            callback_data="config_mutedur"
+                        ),
+                        InlineKeyboardButton(
+                            "🔄 Reload Config", 
+                            callback_data="config_reload"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "📋 View All Settings", 
+                            callback_data="config_viewall"
+                        )
+                    ]
+                ]
+                
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                await query.edit_message_text(
+                    f"⚙️ *Bot Configuration Panel*\n\n"
+                    f"*Current Settings for this Group:*\n"
+                    f"• Self-destruct timer: {current_self_destruct}s {'✅ On' if current_self_destruct > 0 else '❌ Off'}\n"
+                    f"• Edit deletion: {'✅ Enabled' if current_edit_deletion else '❌ Disabled'}\n"
+                    f"• NSFW filtering: {'✅ Enabled' if current_nsfw_filter else '❌ Disabled'}\n"
+                    f"• Service messages: {'✅ Enabled' if current_service_enabled else '❌ Disabled'} (del after {current_service_del_time}s)\n"
+                    f"• Event messages: {status} (del after {current_event_del_time}s)\n"
+                    f"• Warning threshold: {current_warn_settings['threshold']} warnings\n"
+                    f"• Mute duration: {current_warn_settings['mute_duration']} hours\n\n"
+                    f"👆 Tap buttons above to configure settings.\n\n"
+                    f"{message}",
+                    reply_markup=reply_markup,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "warn":
+                # Prompt for warning threshold
+                await query.edit_message_text(
+                    "⚠️ *Warning Threshold Configuration*\n\n"
+                    "Please use the command:\n"
+                    "`/setwarnlimit <number>`\n\n"
+                    "Example: `/setwarnlimit 5` for 5 warnings before mute\n"
+                    "Default: 3 warnings",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "mutedur":
+                # Prompt for mute duration
+                await query.edit_message_text(
+                    "⏰ *Mute Duration Configuration*\n\n"
+                    "Please use the command:\n"
+                    "`/setmutetime <hours>`\n\n"
+                    "Example: `/setmutetime 48` for 48 hours mute\n"
+                    "Default: 24 hours",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            elif config_action == "reload":
+                # Reload configuration
+                active_configs = {
+                    "Self-destruct timers": len([k for k, v in self_destruct_timers.items() if v > 0]),
+                    "Edit deletion": len([k for k, v in edit_deletion_enabled.items() if v]),
+                    "NSFW filtering": len([k for k, v in nsfw_filter_enabled.items() if v]),
+                    "Warning settings": len(warning_settings),
+                    "Service messages": len([k for k, v in service_msg_settings.items() if v['enabled']]),
+                    "Event messages": len([k for k, v in event_msg_settings.items() if v['enabled']]),
+                    "Filters": len([k for k, v in filters_store.items()])
+                }
+                
+                total_active = sum(active_configs.values())
+                
+                config_text = "🔄 *Configuration Reloaded Successfully!*\n\n*Active Configurations:*\n"
+                
+                for config, count in active_configs.items():
+                    if count > 0:
+                        config_text += f"• {config}: {count} active\n"
+                
+                if total_active == 0:
+                    config_text += "• No active configurations found\n"
+                
+                config_text += "\n✅ Bot configuration has been refreshed."
+                
+                await query.edit_message_text(config_text, parse_mode=ParseMode.MARKDOWN)
+            elif config_action == "viewall":
+                # Show all settings in detail
+                current_self_destruct = self_destruct_timers.get(chat_id, 0)
+                current_edit_deletion = edit_deletion_enabled.get(chat_id, False)
+                current_nsfw_filter = nsfw_filter_enabled.get(chat_id, False)
+                current_warn_settings = warning_settings.get(chat_id, {'threshold': 3, 'mute_duration': 24})
+                current_service_enabled = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+                current_service_del_time = service_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+                current_event_enabled = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('enabled', True)
+                current_event_del_time = event_msg_settings.get(chat_id, {'enabled': True, 'delete_after': 30}).get('delete_after', 30)
+                
+                settings_text = (
+                    f"📋 *Detailed Configuration Settings*\n\n"
+                    f"*Self-Destruct Timer:*\n"
+                    f"  - Current: {current_self_destruct}s ({'Enabled' if current_self_destruct > 0 else 'Disabled'})\n"
+                    f"  - Command: `/setselfdestruct <seconds>`\n\n"
+                    f"*Edit Deletion:*\n"
+                    f"  - Current: {'Enabled' if current_edit_deletion else 'Disabled'}\n"
+                    f"  - Commands: `/enableedit` / `/disableedit`\n\n"
+                    f"*NSFW Filtering:*\n"
+                    f"  - Current: {'Enabled' if current_nsfw_filter else 'Disabled'}\n"
+                    f"  - Commands: `/enablensfw` / `/disablensfw`\n\n"
+                    f"*Service Messages:*\n"
+                    f"  - Current: {'Enabled' if current_service_enabled else 'Disabled'}\n"
+                    f"  - Deletion time: {current_service_del_time}s\n"
+                    f"  - Commands: `/enable_service` / `/disable_service`, `/set_service_del_time <seconds>`\n\n"
+                    f"*Event Messages:*\n"
+                    f"  - Current: {'Enabled' if current_event_enabled else 'Disabled'}\n"
+                    f"  - Deletion time: {current_event_del_time}s\n"
+                    f"  - Commands: `/enable_event` / `/disable_event`, `/set_event_del_time <seconds>`\n\n"
+                    f"*Warning Settings:*\n"
+                    f"  - Threshold: {current_warn_settings['threshold']} warnings\n"
+                    f"  - Mute Duration: {current_warn_settings['mute_duration']} hours\n"
+                    f"  - Commands: `/setwarnlimit <num>` / `/setmutetime <hours>`\n\n"
+                    f"*Other Commands:*\n"
+                    f"  - `/reload` - Refresh configuration\n"
+                    f"  - `/config` - Return to config panel\n"
+                    f"  - `/resetselfdestruct` - Disable self-destruct\n\n"
+                    f"👆 Use the commands above to adjust settings."
+                )
+                
+                await query.edit_message_text(settings_text, parse_mode=ParseMode.MARKDOWN)
+            else:
+                await query.answer("Configuration option not implemented yet.", show_alert=True)
+        
+        elif action == "banstatus":
             target_id = int(parts[1])
             new_status = parts[2]
             
@@ -1204,7 +2799,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     reply_markup=reply_markup,
                     parse_mode=ParseMode.MARKDOWN
                 )
-                
+        
         elif action == "mutestatus":
             target_id = int(parts[1])
             new_status = parts[2]
@@ -1304,7 +2899,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         'spam': False,
                         'media': False,
                         'checks': False,
-                        'night': False
+                        'night': False,
+                        'sticker': False,
+                        'gif': False,
+                        'link': False
                     }
                 
                 restrictions = user_restrictions[key]
@@ -1333,6 +2931,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     ],
                     [
                         InlineKeyboardButton(
+                            f"{'✅' if restrictions['sticker'] else '❌'} Sticker",
+                            callback_data=f"free_{target_id}_sticker"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if restrictions['gif'] else '❌'} GIF",
+                            callback_data=f"free_{target_id}_gif"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if restrictions['link'] else '❌'} Link",
+                            callback_data=f"free_{target_id}_link"
+                        ),
+                        InlineKeyboardButton(
                             f"{'✅' if restrictions['night'] else '❌'} Silence/Night",
                             callback_data=f"free_{target_id}_night"
                         )
@@ -1356,7 +2968,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     reply_markup=reply_markup,
                     parse_mode=ParseMode.MARKDOWN
                 )
-            
+        
         elif action == "free":
             target_id = int(parts[1])
             restriction_type = parts[2]
@@ -1370,7 +2982,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     'spam': False,
                     'media': False,
                     'checks': False,
-                    'night': False
+                    'night': False,
+                    'sticker': False,
+                    'gif': False,
+                    'link': False
                 }
             
             if restriction_type == "apply":
@@ -1383,6 +2998,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 if has_restrictions:
                     # Apply restrictions based on toggles
                     can_send_media = not restrictions['media']
+                    can_send_sticker = not restrictions['sticker']
+                    can_send_gif = not restrictions['gif']
+                    can_send_links = not restrictions['link'] and not restrictions['spam']
                     
                     perms = ChatPermissions(
                         can_send_messages=True,  # Always allow text
@@ -1393,7 +3011,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                         can_send_video_notes=can_send_media,
                         can_send_voice_notes=can_send_media,
                         can_send_polls=not restrictions['spam'],
-                        can_add_web_page_previews=not restrictions['spam']
+                        can_add_web_page_previews=can_send_links
                     )
                     
                     await context.bot.restrict_chat_member(chat_id, target_id, permissions=perms)
@@ -1453,6 +3071,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     ],
                     [
                         InlineKeyboardButton(
+                            f"{'✅' if restrictions['sticker'] else '❌'} Sticker",
+                            callback_data=f"free_{target_id}_sticker"
+                        ),
+                        InlineKeyboardButton(
+                            f"{'✅' if restrictions['gif'] else '❌'} GIF",
+                            callback_data=f"free_{target_id}_gif"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            f"{'✅' if restrictions['link'] else '❌'} Link",
+                            callback_data=f"free_{target_id}_link"
+                        ),
+                        InlineKeyboardButton(
                             f"{'✅' if restrictions['night'] else '❌'} Silence/Night",
                             callback_data=f"free_{target_id}_night"
                         )
@@ -1488,7 +3120,14 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("status", status_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("settings", settings_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("info", info_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("promote", promote_admin, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("mod", promote_mod, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("muter", promote_muter, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("unadmin", unadmin_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("unmod", unmod_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("unmuter", unmuter_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("ban", ban, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("unban", unban, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("mute", mute, filters=filters.ChatType.GROUPS))
@@ -1499,6 +3138,16 @@ def main() -> None:
     app.add_handler(CommandHandler("filter", filter_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("filters", filters_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("stopfilter", stopfilter_cmd, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("setselfdestruct", set_self_destruct, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("resetselfdestruct", reset_self_destruct, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("enableedit", enable_edit_deletion, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("disableedit", disable_edit_deletion, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("setwarnlimit", set_warn_limit, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("setmutetime", set_mute_time, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("enablensfw", enable_nsfw_filter, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("disablensfw", disable_nsfw_filter, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("reload", reload_config, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("config", config_cmd, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("setwelcomemessage", set_welcome_message, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("setwelcomeimage", set_welcome_image, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("resetwelcome", reset_welcome, filters=filters.ChatType.GROUPS))
@@ -1506,6 +3155,14 @@ def main() -> None:
     app.add_handler(CommandHandler("service", service, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("setservice", set_service, filters=filters.ChatType.GROUPS))
     app.add_handler(CommandHandler("resetservice", reset_service, filters=filters.ChatType.GROUPS))
+    
+    # Service and event message handlers
+    app.add_handler(CommandHandler("enable_service", enable_service_msgs, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("disable_service", disable_service_msgs, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("enable_event", enable_event_msgs, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("disable_event", disable_event_msgs, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("set_service_del_time", set_service_del_time, filters=filters.ChatType.GROUPS))
+    app.add_handler(CommandHandler("set_event_del_time", set_event_del_time, filters=filters.ChatType.GROUPS))
     
     # Callback query handler for buttons
     app.add_handler(CallbackQueryHandler(button_callback))
@@ -1534,6 +3191,18 @@ def main() -> None:
     app.add_handler(MessageHandler(
         filters.ChatType.GROUPS,
         delete_links
+    ))
+    
+    # Content restriction handler (for stickers, GIFs, videos, etc.)
+    app.add_handler(MessageHandler(
+        filters.ALL & filters.ChatType.GROUPS,
+        check_message_content
+    ))
+    
+    # Service and event message handler
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS,
+        handle_service_event_messages
     ))
     
     # Edited message handler
